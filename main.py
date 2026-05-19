@@ -4,23 +4,82 @@ import pandas as pd
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-st.title("GitHub Repo Contributor Analyzer")
-
-repo_url = st.text_input("Enter GitHub repo URL (e.g. https://github.com/owner/repo)")
-github_token = st.text_input("GitHub Personal Access Token (optional, avoids rate limits)", type="password")
-
 GITHUB_API = "https://api.github.com"
 
 
-def get_headers():
-    """FIX 1: Include auth token to avoid the 60 req/hour rate limit."""
-    if github_token:
-        return {"Authorization": f"token {github_token}"}
+# ── Token resolution ──────────────────────────────────────────────────────────
+# Priority: st.secrets → session_state (user-entered) → None
+
+def validate_token(token: str) -> bool:
+    """Call /user to verify the token is valid and not expired."""
+    if not token:
+        return False
+    r = requests.get(f"{GITHUB_API}/user", headers={"Authorization": f"token {token}"})
+    return r.status_code == 200
+
+
+def resolve_token() -> str | None:
+    """
+    Return the best available token:
+      1. st.secrets["GITHUB_TOKEN"]  — if present and valid
+      2. st.session_state token      — entered by the user in the UI
+      3. None                        — unauthenticated
+    """
+    # 1. Check Streamlit secrets
+    secret_token = st.secrets.get("GITHUB_TOKEN", "")
+    if secret_token:
+        if validate_token(secret_token):
+            return secret_token
+        else:
+            st.warning(
+                "⚠️ A `GITHUB_TOKEN` was found in `st.secrets` but it is invalid or expired. "
+                "Please enter a valid token below.",
+                icon="🔑",
+            )
+
+    # 2. Fall back to user-entered token in session state
+    return st.session_state.get("github_token") or None
+
+
+def get_headers(token: str | None) -> dict:
+    if token:
+        return {"Authorization": f"token {token}"}
     return {}
 
 
-def parse_repo(url):
-    """FIX 2: Validate URL and handle malformed input gracefully."""
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+st.title("GitHub Repo Contributor Analyzer")
+
+# Resolve token first (runs the secrets check + optional validation warning)
+token = resolve_token()
+
+# Only show the token input field when no valid secret is available
+if token:
+    st.success("✅ Authenticated via `st.secrets` — no token input needed.", icon="🔒")
+else:
+    user_token = st.text_input(
+        "GitHub Personal Access Token",
+        type="password",
+        placeholder="ghp_xxxxxxxxxxxxxxxxxxxx",
+        help=(
+            "Required for repos with > 60 commits. "
+            "Generate one at GitHub → Settings → Developer settings → Personal access tokens."
+        ),
+        key="github_token",          # stored in session_state automatically
+    )
+    # Re-resolve after the widget renders so the entered value is picked up
+    token = st.session_state.get("github_token") or None
+
+repo_url = st.text_input(
+    "GitHub Repository URL",
+    placeholder="https://github.com/owner/repo",
+)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_repo(url: str) -> tuple[str, str]:
     try:
         cleaned = url.strip("/").replace("https://github.com/", "")
         parts = cleaned.split("/")
@@ -32,48 +91,51 @@ def parse_repo(url):
         st.stop()
 
 
-def get_commits(owner, repo):
-    commits = []
-    page = 1
+def get_commits(owner: str, repo: str, headers: dict) -> list:
+    commits, page = [], 1
     while True:
-        url = f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=100&page={page}"
-        r = requests.get(url, headers=get_headers())
-        if r.status_code != 200 or len(r.json()) == 0:
+        r = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=100&page={page}",
+            headers=headers,
+        )
+        if r.status_code != 200 or not r.json():
             break
         commits.extend(r.json())
         page += 1
     return commits
 
 
-def get_commit_detail(owner, repo, sha):
-    """FIX 3: Check HTTP status before returning; return empty dict on failure."""
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}"
-    r = requests.get(url, headers=get_headers())
-    if r.status_code != 200:
-        return {}
-    return r.json()
+def get_commit_detail(owner: str, repo: str, sha: str, headers: dict) -> dict:
+    r = requests.get(
+        f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}",
+        headers=headers,
+    )
+    return r.json() if r.status_code == 200 else {}
 
 
-def get_prs(owner, repo):
-    """FIX 4: Paginate through all PRs, not just the first 100."""
-    prs = []
-    page = 1
+def get_prs(owner: str, repo: str, headers: dict) -> list:
+    prs, page = [], 1
     while True:
-        url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls?state=all&per_page=100&page={page}"
-        r = requests.get(url, headers=get_headers())
-        if r.status_code != 200 or len(r.json()) == 0:
+        r = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls?state=all&per_page=100&page={page}",
+            headers=headers,
+        )
+        if r.status_code != 200 or not r.json():
             break
         prs.extend(r.json())
         page += 1
     return prs
 
 
+# ── Main analysis ─────────────────────────────────────────────────────────────
+
 if repo_url:
     owner, repo = parse_repo(repo_url)
-    st.info(f"Analyzing {owner}/{repo} ...")
+    headers = get_headers(token)
 
-    commits = get_commits(owner, repo)
+    st.info(f"Analyzing **{owner}/{repo}** …")
 
+    commits = get_commits(owner, repo, headers)
     if not commits:
         st.error("No commits found. Check the repo URL or your token permissions.")
         st.stop()
@@ -84,31 +146,22 @@ if repo_url:
         "deletions": 0,
         "files": 0,
         "dates": [],
-        # FIX 5: Track GitHub login separately for PR join
         "login": None,
     })
-
     commit_timeseries = []
 
-    # FIX 6: Show a progress bar so the app doesn't appear frozen
-    progress = st.progress(0, text="Fetching commit details...")
+    progress = st.progress(0, text="Fetching commit details…")
     total = len(commits)
 
     for i, c in enumerate(commits):
-        sha = c["sha"]
-        detail = get_commit_detail(owner, repo, sha)
-
+        detail = get_commit_detail(owner, repo, c["sha"], headers)
         if not detail:
             continue
 
-        author_name = (detail.get("commit", {})
-                             .get("author", {})
-                             .get("name", "unknown"))
-
-        # FIX 5 (cont.): Capture the GitHub login alongside the git author name
-        login = None
-        if detail.get("author"):
-            login = detail["author"].get("login")
+        author_name = (
+            detail.get("commit", {}).get("author", {}).get("name", "unknown")
+        )
+        login = detail.get("author") and detail["author"].get("login")
         contributor_stats[author_name]["login"] = login
 
         stats = detail.get("stats", {})
@@ -122,17 +175,16 @@ if repo_url:
             contributor_stats[author_name]["dates"].append(date)
             commit_timeseries.append(date)
 
-        progress.progress((i + 1) / total, text=f"Processing commit {i + 1}/{total}")
+        progress.progress((i + 1) / total, text=f"Processing commit {i + 1} / {total}")
 
     progress.empty()
 
-    # FIX 5 (cont.): Build PR counts keyed by GitHub login
-    prs = get_prs(owner, repo)
+    # PR counts keyed by GitHub login
+    prs = get_prs(owner, repo, headers)
     pr_counts_by_login = defaultdict(int)
     for pr in prs:
         if isinstance(pr, dict) and pr.get("user"):
-            login = pr["user"].get("login", "unknown")
-            pr_counts_by_login[login] += 1
+            pr_counts_by_login[pr["user"].get("login", "unknown")] += 1
 
     # Build dataframe
     rows = []
@@ -142,10 +194,10 @@ if repo_url:
         pr_count = pr_counts_by_login.get(login, 0)
 
         score = (
-            data["commits"] * 1 +
-            churn / 100 +
-            data["files"] * 0.5 +
-            pr_count * 2
+            data["commits"] * 1
+            + churn / 100
+            + data["files"] * 0.5
+            + pr_count * 2
         )
 
         rows.append({
@@ -157,8 +209,7 @@ if repo_url:
             "Churn": churn,
             "Files Changed": data["files"],
             "PRs": pr_count,
-            # FIX 7: Removed "Commit Frequency" — it was identical to "Commits"
-            "Score": round(score, 2)
+            "Score": round(score, 2),
         })
 
     df = pd.DataFrame(rows).sort_values(by="Score", ascending=False)
@@ -166,25 +217,27 @@ if repo_url:
     st.subheader("Contributor Stats")
     st.dataframe(df)
 
-    # Plot: commits per contributor
     st.subheader("Commits per Contributor")
     fig, ax = plt.subplots()
     ax.bar(df["Contributor"], df["Commits"])
     plt.xticks(rotation=45, ha="right")
     st.pyplot(fig)
 
-    # Plot: code churn
     st.subheader("Code Churn (Additions + Deletions)")
     fig2, ax2 = plt.subplots()
     ax2.bar(df["Contributor"], df["Churn"])
     plt.xticks(rotation=45, ha="right")
     st.pyplot(fig2)
 
-    # Commit activity over time
     st.subheader("Commit Activity Over Time")
     if commit_timeseries:
-        # FIX 8: Set the datetime column as index BEFORE resampling
         ts = pd.to_datetime(commit_timeseries)
-        ts_df = pd.DataFrame({"date": ts})
-        ts_df = ts_df.set_index("date").assign(count=1).resample("D").sum().fillna(0)
+        ts_df = (
+            pd.DataFrame({"date": ts})
+            .set_index("date")
+            .assign(count=1)
+            .resample("D")
+            .sum()
+            .fillna(0)
+        )
         st.line_chart(ts_df)
